@@ -5,6 +5,7 @@ Clic droit sur un membre -> Applications -> « A été malveillant(e) avec moi �
 -> enregistre (date/heure, malveillant, malveillé) dans Supabase,
    1 report par couple malveillant/malveillé et par heure.
 """
+import asyncio
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ from fastapi import FastAPI, Request, Response
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
-from discord_commands import REPORT_COMMAND_NAME
+from discord_commands import COMMANDS, REPORT_COMMAND_NAME
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +27,11 @@ log = logging.getLogger("malveillance")
 DISCORD_PUBLIC_KEY = os.environ["DISCORD_PUBLIC_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
+
+# Pour enregistrer automatiquement l'option de clic droit au démarrage
+DISCORD_APPLICATION_ID = os.environ.get("DISCORD_APPLICATION_ID")
+DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 
 verify_key = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
 
@@ -41,12 +47,35 @@ EPHEMERAL = 1 << 6
 http: httpx.AsyncClient
 
 
+async def register_commands():
+    """Crée ou met à jour l'option de clic droit sur le serveur (sans effet si rien n'a changé)."""
+    if not (DISCORD_APPLICATION_ID and DISCORD_GUILD_ID and DISCORD_BOT_TOKEN):
+        log.warning("DISCORD_APPLICATION_ID, DISCORD_GUILD_ID ou DISCORD_BOT_TOKEN manquant : commandes non enregistrées")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.put(
+                f"https://discord.com/api/v10/applications/{DISCORD_APPLICATION_ID}"
+                f"/guilds/{DISCORD_GUILD_ID}/commands",
+                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+                json=COMMANDS,
+            )
+        if resp.is_error:
+            log.error("Enregistrement des commandes refusé (%s) : %s", resp.status_code, resp.text)
+        else:
+            log.info("Commandes enregistrées : %s", ", ".join(c["name"] for c in resp.json()))
+    except Exception:
+        log.exception("Impossible d'enregistrer les commandes Discord")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global http
     # Discord exige une réponse en moins de 3 s : on coupe Supabase à 2,5 s
     http = httpx.AsyncClient(base_url=SUPABASE_URL, headers=SUPABASE_HEADERS, timeout=2.5)
+    registering = asyncio.create_task(register_commands())  # en arrière-plan, ne retarde pas le démarrage
     yield
+    registering.cancel()
     await http.aclose()
 
 
